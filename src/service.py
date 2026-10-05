@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
+from .repository import utcnow
 from .rules import RuleEngine
 
 
@@ -56,7 +57,68 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if action == "correct_pedigree":
+            self._apply_descendant_recalculation(
+                entity_id, actor, cause_ancestor_id=entity_id
+            )
         return updated
+
+    def _apply_descendant_recalculation(self, animal_id, actor, cause_ancestor_id):
+        """Recompute coefficients for pairings along the corrected animal's
+        lineage and revert any that now exceed the inbreeding threshold.
+
+        Pairings that cannot be recomputed keep their original status and record
+        a recheck_error so the operation can be retried later without losing data.
+        """
+        results = self.rules.recalculate_descendant_pairings(
+            animal_id, self._lookup, cause_ancestor_id=cause_ancestor_id
+        )
+        for result in results:
+            pairing = self.repository.get_entity(result["pairing_id"])
+            if not pairing:
+                continue
+            pdata = dict(pairing["data"])
+            if result["error"]:
+                pdata["recheck_error"] = result["error"]
+                self.repository.update_entity(
+                    pairing["id"], pairing["version"], pairing["status"], pdata
+                )
+                self.audit.record(
+                    pairing["id"],
+                    actor,
+                    "recheck_failed",
+                    pairing["status"],
+                    pairing["status"],
+                    {
+                        "error": result["error"],
+                        "cause_ancestor": cause_ancestor_id,
+                    },
+                )
+                continue
+            if result["over_threshold"] and pairing["status"] == "approved":
+                pdata["reverted_from"] = "approved"
+                pdata["caused_by_ancestor"] = cause_ancestor_id
+                pdata["reverted_coefficient"] = result["coefficient"]
+                pdata["recheck_error"] = None
+                self.repository.update_entity(
+                    pairing["id"], pairing["version"], "proposed", pdata
+                )
+                self.audit.record(
+                    pairing["id"],
+                    actor,
+                    "revert_to_proposed",
+                    "approved",
+                    "proposed",
+                    {
+                        "cause_ancestor": cause_ancestor_id,
+                        "coefficient": result["coefficient"],
+                    },
+                )
+            elif pdata.get("recheck_error"):
+                pdata["recheck_error"] = None
+                self.repository.update_entity(
+                    pairing["id"], pairing["version"], pairing["status"], pdata
+                )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
